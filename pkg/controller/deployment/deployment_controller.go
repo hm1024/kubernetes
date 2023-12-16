@@ -480,12 +480,14 @@ func (dc *DeploymentController) worker(ctx context.Context) {
 }
 
 func (dc *DeploymentController) processNextWorkItem(ctx context.Context) bool {
+	// 从队列获取任务, 拿不到任务就阻塞在条件变量上.
 	key, quit := dc.queue.Get()
 	if quit {
 		return false
 	}
 	defer dc.queue.Done(key)
 
+	// 调用 syncHandler 处理
 	err := dc.syncHandler(ctx, key.(string))
 	dc.handleErr(ctx, err, key)
 
@@ -596,6 +598,7 @@ func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) 
 		logger.V(4).Info("Finished syncing deployment", "deployment", klog.KRef(namespace, name), "duration", time.Since(startTime))
 	}()
 
+	// 从 informer cache 中获取指定 ns 和 name 的 deployment 对象
 	deployment, err := dc.dLister.Deployments(namespace).Get(name)
 	if errors.IsNotFound(err) {
 		logger.V(2).Info("Deployment has been deleted", "deployment", klog.KRef(namespace, name))
@@ -609,6 +612,7 @@ func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) 
 	// TODO: Deep-copy only when needed.
 	d := deployment.DeepCopy()
 
+	// 判断 selecor 是否为空
 	everything := metav1.LabelSelector{}
 	if reflect.DeepEqual(d.Spec.Selector, &everything) {
 		dc.eventRecorder.Eventf(d, v1.EventTypeWarning, "SelectingAll", "This deployment is selecting all pods. A non-empty selector is required.")
@@ -619,6 +623,7 @@ func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) 
 		return nil
 	}
 
+	// 获取 deployment 对应的所有 rs, 通过 LabelSelector 进行匹配
 	// List ReplicaSets owned by this Deployment, while reconciling ControllerRef
 	// through adoption/orphaning.
 	rsList, err := dc.getReplicaSetsForDeployment(ctx, d)
@@ -628,13 +633,16 @@ func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) 
 	// List all Pods owned by this Deployment, grouped by their ReplicaSet.
 	// Current uses of the podMap are:
 	//
-	// * check if a Pod is labeled correctly with the pod-template-hash label.
-	// * check that no old Pods are running in the middle of Recreate Deployments.
+	// * check if a Pod is labeled correctly with the pod-template-hash label. 检查 Pod 是否正确标记了 pod-template-hash 标签。
+	// * check that no old Pods are running in the middle of Recreate Deployments. 检查在重新创建部署的过程中是否没有旧的 Pod 在运行。
+	// 获取当前 Deployment 对象关联的 pod
 	podMap, err := dc.getPodMapForDeployment(d, rsList)
 	if err != nil {
 		return err
 	}
 
+	// 当 DeletionTimestamp 字段存在时, 就意味着需要删除该 deployment
+	// 如果该 deployment 处于删除状态，则更新其 status;
 	if d.DeletionTimestamp != nil {
 		return dc.syncStatusOnly(ctx, d, rsList)
 	}
@@ -646,6 +654,7 @@ func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) 
 		return err
 	}
 
+	// 如果是 pause 状态则进行 sync 同步.
 	if d.Spec.Paused {
 		return dc.sync(ctx, d, rsList)
 	}
@@ -653,6 +662,7 @@ func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) 
 	// rollback is not re-entrant in case the underlying replica sets are updated with a new
 	// revision so we should ensure that we won't proceed to update replica sets until we
 	// make sure that the deployment has cleaned up its rollback spec in subsequent enqueues.
+	// 检查是否为回滚操作
 	if getRollbackTo(d) != nil {
 		return dc.rollback(ctx, d, rsList)
 	}
@@ -661,14 +671,18 @@ func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) 
 	if err != nil {
 		return err
 	}
+	// 检查 deployment 是否处于 scale 状态
 	if scalingEvent {
 		return dc.sync(ctx, d, rsList)
 	}
 
+	// 更新操作
 	switch d.Spec.Strategy.Type {
 	case apps.RecreateDeploymentStrategyType:
+		// 重建模式
 		return dc.rolloutRecreate(ctx, d, rsList, podMap)
 	case apps.RollingUpdateDeploymentStrategyType:
+		// 滚动更新模式
 		return dc.rolloutRolling(ctx, d, rsList)
 	}
 	return fmt.Errorf("unexpected deployment strategy type: %s", d.Spec.Strategy.Type)

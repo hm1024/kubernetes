@@ -51,6 +51,7 @@ func (dc *DeploymentController) sync(ctx context.Context, d *apps.Deployment, rs
 	if err != nil {
 		return err
 	}
+
 	if err := dc.scale(ctx, d, newRS, oldRSs); err != nil {
 		// If we get an error while trying to scale, the deployment will be requeued
 		// so we can abort this resync
@@ -321,12 +322,15 @@ func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Depl
 	// There are old replica sets with pods and the new replica set is not saturated.
 	// We need to proportionally scale all replica sets (new and old) in case of a
 	// rolling deployment.
+	// 如果 dm 有配置滚动更新策略, 那么就需要按照策略去对 rs 进行扩缩容
 	if deploymentutil.IsRollingUpdate(deployment) {
 		allRSs := controller.FilterActiveReplicaSets(append(oldRSs, newRS))
 		allRSsReplicas := deploymentutil.GetReplicaCountForReplicaSets(allRSs)
 
+		// 计算最大可以创建出的 pod 数
 		allowedSize := int32(0)
 		if *(deployment.Spec.Replicas) > 0 {
+			// 预期的副本数加上 maxSurge 为最大允许数
 			allowedSize = *(deployment.Spec.Replicas) + deploymentutil.MaxSurge(*deployment)
 		}
 
@@ -530,6 +534,7 @@ func calculateStatus(allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployme
 //
 // rsList should come from getReplicaSetsForDeployment(d).
 func (dc *DeploymentController) isScalingEvent(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet) (bool, error) {
+	// 依旧获取新旧所有的 rs 对象.
 	newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, false)
 	if err != nil {
 		return false, err
@@ -537,10 +542,12 @@ func (dc *DeploymentController) isScalingEvent(ctx context.Context, d *apps.Depl
 	allRSs := append(oldRSs, newRS)
 	logger := klog.FromContext(ctx)
 	for _, rs := range controller.FilterActiveReplicaSets(allRSs) {
+		// 从 rs annotation 中拿到 deployment.kubernetes.io/desired-replicas 的值
 		desired, ok := deploymentutil.GetDesiredReplicasAnnotation(logger, rs)
 		if !ok {
 			continue
 		}
+		// 如果不是 replicas 结构, 则需要库容
 		if desired != *(d.Spec.Replicas) {
 			return true, nil
 		}
